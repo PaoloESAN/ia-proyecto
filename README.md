@@ -16,15 +16,24 @@ split 70/13/17 train/val/test + transforms + DataLoaders.
 
 ## Cómo correr (main)
 
+Con uv (recomendado):
+
+```bash
+uv sync
+# abrir notebooks/01_lectura_preprocesamiento.ipynb en VS Code / Jupyter
+```
+
+Con pip (alternativa):
+
 ```bash
 py -m pip install -r requirements.txt
-# abrir notebooks/01_lectura_preprocesamiento.ipynb en VS Code / Jupyter
 ```
 
 ## Estructura (main)
 
 ```
 README.md
-requirements.txt
+pyproject.toml + uv.lock + .python-version  # entorno uv
+requirements.txt                            # alternativa pip (se conserva)
 notebooks/01_lectura_preprocesamiento.ipynb  # exp.1 autocontenido: lectura + prepro
 ```

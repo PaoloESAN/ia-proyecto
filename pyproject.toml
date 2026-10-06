@@ -1,0 +1,13 @@
+[project]
+name = "ia-proyecto"
+version = "0.1.0"
+description = "Clasificacion de basura con TrashNet - Exp 1: lectura y preprocesamiento"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "torchvision",
+    "datasets",
+    "pillow",
+    "matplotlib",
+]
