@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Datos y modelos (se descargan / generan, no se versionan en main)
+data/
+*.pt
+*.pth
+*.jpg
+*.jpeg
+*.png
+
+# OS / editores
+.DS_Store
+Thumbs.db
+.vscode/
