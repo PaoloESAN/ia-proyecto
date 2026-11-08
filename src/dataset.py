@@ -1,9 +1,12 @@
-"""Lectura del dataset TrashNet (espejo HuggingFace) y split train/val/test.
+"""Lectura del dataset TrashNet (espejo HuggingFace) y split estratificado train/val/test.
 
-Basado en Pasos 2 y 4 de TrashNet_Clasificacion.ipynb.
+También expone utilidades del pipeline multi-dataset de BasuraFix
+(TrashNet + RealWaste + Garbage12, 8 clases unificadas, deduplicación SHA-1).
 """
+from collections import defaultdict
 import random
 
+import numpy as np
 from torch.utils.data import Dataset
 
 
@@ -42,8 +45,29 @@ class TrashDataset(Dataset):
         return self.tf(r["image"].convert("RGB")), int(r["label"])
 
 
-def split_indices(n_total, seed=SEED, p_train=0.70, p_val=0.13):
-    """Divide indices en train/val/test (70/13/17 como el paper original)."""
+def split_indices(n_total, seed=SEED, p_train=0.70, p_val=0.13, labels=None):
+    """Divide indices en train/val/test (estratificado si se provee `labels`)."""
+    if labels is not None:
+        rng = np.random.default_rng(seed)
+        by_class = defaultdict(list)
+        for idx, lbl in enumerate(labels):
+            by_class[int(lbl)].append(idx)
+        train_idx, val_idx, test_idx = [], [], []
+        p_test = max(0.0, 1.0 - p_train - p_val)
+        for items in by_class.values():
+            order = rng.permutation(len(items))
+            n = len(items)
+            n_test = int(round(n * p_test))
+            n_val = int(round(n * p_val))
+            for pos, k in enumerate(order):
+                if pos < n_test:
+                    test_idx.append(items[k])
+                elif pos < n_test + n_val:
+                    val_idx.append(items[k])
+                else:
+                    train_idx.append(items[k])
+        return train_idx, val_idx, test_idx
+
     indices = list(range(n_total))
     random.Random(seed).shuffle(indices)
     n_tr = int(p_train * n_total)
