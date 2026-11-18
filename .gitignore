@@ -7,7 +7,6 @@ venv/
 
 # Datos y modelos (se descargan / generan, no se versionan en main)
 data/
-*.pt
 *.pth
 *.jpg
 *.jpeg
