@@ -1,0 +1,174 @@
+name: Build Standalone BasuraFix.exe
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "app_reciclaje.py"
+      - "basurafix_mobilenetv3.pt"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    name: Build & Test Standalone Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify model weights exist
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "basurafix_mobilenetv3.pt")) {
+            Write-Error "No se encontró basurafix_mobilenetv3.pt en la raíz del repositorio."
+            exit 1
+          }
+          Get-Item "basurafix_mobilenetv3.pt" | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB, 2)}}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install PyTorch CPU and runtime dependencies
+        shell: pwsh
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy pillow pillow-avif-plugin pillow-heif opencv-python tkinterdnd2 pyinstaller
+
+      - name: Generate application icon (basurafix.ico)
+        shell: pwsh
+        run: |
+          $code = @'
+          from PIL import Image, ImageDraw
+          size = 256
+          img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+          draw = ImageDraw.Draw(img)
+          draw.ellipse((10, 10, size - 10, size - 10), fill=(52, 211, 153, 255), outline=(5, 46, 34, 255), width=10)
+          draw.ellipse((54, 54, size - 54, size - 54), outline=(5, 46, 34, 255), width=20)
+          draw.polygon([(128, 34), (168, 74), (128, 102)], fill=(5, 46, 34, 255))
+          draw.polygon([(204, 174), (154, 198), (156, 152)], fill=(5, 46, 34, 255))
+          draw.polygon([(52, 174), (100, 152), (102, 198)], fill=(5, 46, 34, 255))
+          img.save("basurafix.ico", format="ICO", sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          '@
+          python -c $code
+
+      - name: Build standalone BasuraFix.exe with PyInstaller
+        shell: pwsh
+        run: |
+          $tvCode = @'
+          import pathlib, torchvision
+          root = pathlib.Path(torchvision.__file__).parent
+          mods = sorted({p.stem.split(".")[0] for p in root.glob("*.pyd")})
+          print(" ".join(f"--hidden-import torchvision.{m}" for m in mods))
+          '@
+          $tvHidden = python -c $tvCode
+          Write-Host "Torchvision native hidden-imports: $tvHidden"
+
+          $argsList = @(
+            "--noconfirm",
+            "--clean",
+            "--onefile",
+            "--windowed",
+            "--name", "BasuraFix",
+            "--icon", "basurafix.ico",
+            "--add-data", "basurafix_mobilenetv3.pt;.",
+            "--add-data", "basurafix.ico;.",
+            "--collect-binaries", "torchvision",
+            "--collect-all", "tkinterdnd2",
+            "--collect-all", "pillow_heif",
+            "--collect-all", "pillow_avif",
+            "--exclude-module", "matplotlib",
+            "--exclude-module", "scipy",
+            "--exclude-module", "sklearn",
+            "--exclude-module", "pandas",
+            "--exclude-module", "datasets",
+            "--exclude-module", "pyarrow",
+            "--exclude-module", "IPython",
+            "--exclude-module", "jupyter",
+            "--exclude-module", "pytest"
+          )
+          if ($tvHidden.Trim()) {
+            $argsList += ($tvHidden.Trim() -split '\s+')
+          }
+          $argsList += "app_reciclaje.py"
+
+          pyinstaller @argsList
+          Get-Item "dist\BasuraFix.exe" | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB, 2)}}
+
+      - name: Test standalone BasuraFix.exe in isolated environment (no Python, no external .pt)
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP "basurafix_isolated_test"
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          Copy-Item "dist\BasuraFix.exe" -Destination $testDir -Force
+
+          $exePath = Join-Path $testDir "BasuraFix.exe"
+          $reportPath = Join-Path $testDir "selftest_report.json"
+
+          # Ejecutar en un entorno completamente aislado sin Python en PATH ni .pt externo
+          $oldPath = $env:PATH
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          Push-Location $testDir
+          $proc = Start-Process -FilePath $exePath -ArgumentList "--self-test", "`"$reportPath`"" -Wait -PassThru
+          Pop-Location
+          $env:PATH = $oldPath
+
+          Write-Host "Self-test exit code: $($proc.ExitCode)"
+          if (Test-Path $reportPath) {
+            Write-Host "Self-test report:"
+            Get-Content $reportPath
+          } else {
+            Write-Error "BasuraFix.exe no generó el reporte de self-test."
+            exit 1
+          }
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "El self-test de BasuraFix.exe falló con código $($proc.ExitCode)."
+            exit 1
+          }
+
+          $json = Get-Content $reportPath -Raw | ConvertFrom-Json
+          if (-not ($json.ok -and $json.frozen -and $json.tkinter_ok -and $json.cv2_has_videocapture)) {
+            Write-Error "Alguna verificación crítica del self-test falló."
+            exit 1
+          }
+          Write-Host "✅ Standalone BasuraFix.exe verificado 100% OK!"
+
+      - name: Upload BasuraFix.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BasuraFix-Windows-x64
+          path: dist/BasuraFix.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release with BasuraFix.exe
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && format('BasuraFix {0}', github.ref_name) || 'BasuraFix (Última versión Windows)' }}
+          body: |
+            ## ♻️ BasuraFix — Ejecutable Standalone para Windows
+
+            Descarga **`BasuraFix.exe`** abajo y hazle doble clic. **No necesitas instalar Python ni ninguna librería.**
+
+            ### Incluye todo embebido:
+            - Modelo entrenado `MobileNetV3-Large` (**96.34% de precisión en test con TTA**, 8 clases)
+            - Interfaz gráfica (fotos `JPG/PNG/WEBP/AVIF/HEIC` + arrastrar y soltar)
+            - **Webcam en tiempo real** + captura de fotograma
+            - **Mapas de calor Grad-CAM**
+          files: dist/BasuraFix.exe
+          make_latest: true

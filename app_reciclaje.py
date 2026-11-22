@@ -22,9 +22,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -54,8 +56,28 @@ except Exception:
 # ===========================================================================
 # 1. CONFIGURACIÓN Y TAXONOMÍA (8 CLASES)
 # ===========================================================================
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = BASE_DIR / "basurafix_mobilenetv3.pt"
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    BUNDLE_DIR = Path(__file__).resolve().parent
+    APP_DIR = BUNDLE_DIR
+
+BASE_DIR = APP_DIR
+
+
+def _resolve_resource(filename: str) -> Path:
+    """Busca primero junto al .exe/.py y luego dentro del bundle PyInstaller."""
+    external = APP_DIR / filename
+    if external.exists():
+        return external
+    bundled = BUNDLE_DIR / filename
+    if bundled.exists():
+        return bundled
+    return external
+
+
+DEFAULT_MODEL_PATH = _resolve_resource("basurafix_mobilenetv3.pt")
 
 CLASSES: list[str] = [
     "cardboard",
@@ -130,6 +152,10 @@ UNCERTAIN_MARGIN = 0.10
 # 2. MODELO, GRAD-CAM E INFERENCIA (CON TTA)
 # ===========================================================================
 def setup_console() -> None:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -269,25 +295,37 @@ class GradCAM:
         return cam.cpu().numpy(), class_index
 
 
+def _apply_turbo_colormap(cam_uint8: np.ndarray) -> np.ndarray:
+    """Convierte un mapa 2D [0..255] en RGB usando Turbo (OpenCV o fallback NumPy)."""
+    try:
+        import cv2
+
+        bgr = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_TURBO)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    except Exception:
+        t = cam_uint8.astype(np.float32) / 255.0
+        r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+        g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+        b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+        return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+
+
 def overlay_heatmap(
     image: Image.Image, cam: np.ndarray, alpha: float = 0.45, size: int = 512
 ) -> tuple[Image.Image, Image.Image]:
-    import matplotlib
-
     base = image.convert("RGB")
     width, height = base.size
     scale = size / max(width, height)
     new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
     base = base.resize(new_size, Image.Resampling.LANCZOS)
 
-    cam_img = Image.fromarray((cam * 255).astype(np.uint8)).resize(
+    cam_img = Image.fromarray((np.clip(cam, 0.0, 1.0) * 255).astype(np.uint8)).resize(
         new_size, Image.Resampling.BILINEAR
     )
-    cam_arr = np.asarray(cam_img, dtype=np.float32) / 255.0
-    cmap = matplotlib.colormaps["turbo"]
-    heat = (cmap(cam_arr)[..., :3] * 255).astype(np.uint8)
-    original = np.asarray(base).astype(np.float32)
-    blended = (original * (1 - alpha) + heat * alpha).astype(np.uint8)
+    cam_uint8 = np.asarray(cam_img, dtype=np.uint8)
+    heat = _apply_turbo_colormap(cam_uint8).astype(np.float32)
+    original = np.asarray(base, dtype=np.float32)
+    blended = (original * (1.0 - alpha) + heat * alpha).clip(0, 255).astype(np.uint8)
     return base, Image.fromarray(blended)
 
 
@@ -500,11 +538,18 @@ class BasuraFixApp:
         self._webcam_job = None
         self._webcam_predicting = False
         self._last_webcam_pred_time = 0.0
+        self._release_thread: threading.Thread | None = None
 
         self.root.title("BasuraFix · Clasificador de Basura con IA + Webcam")
         self.root.geometry("1160x780")
         self.root.minsize(1020, 700)
         self.root.configure(bg=BG)
+        icon_path = _resolve_resource("basurafix.ico")
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(str(icon_path))
+            except Exception:
+                pass
 
         self._init_fonts()
         self._build_ui()
@@ -912,7 +957,9 @@ class BasuraFixApp:
             )
             return
 
-        self.stop_webcam(keep_frame=False)
+        self.stop_webcam(keep_frame=False, analyze=False)
+        if self._release_thread is not None and self._release_thread.is_alive():
+            self._release_thread.join(timeout=1.5)
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if sys.platform == "win32" else cv2.VideoCapture(0)
         if not cap or not cap.isOpened():
             cap = cv2.VideoCapture(0)
@@ -933,7 +980,7 @@ class BasuraFixApp:
         self._set_status("Webcam en vivo · Clasificando residuos automáticamente…", "ready")
         self._webcam_loop()
 
-    def stop_webcam(self, keep_frame: bool = True) -> None:
+    def stop_webcam(self, keep_frame: bool = True, analyze: bool = True) -> None:
         was_active = self._webcam_active
         self._webcam_active = False
         if self._webcam_job is not None:
@@ -945,14 +992,17 @@ class BasuraFixApp:
         cap = self._cap
         self._cap = None
         if cap is not None:
-            threading.Thread(target=cap.release, daemon=True).start()
+            t = threading.Thread(target=cap.release, daemon=True)
+            t.start()
+            self._release_thread = t
         self.webcam_btn._normal_bg = BLUE
         self.webcam_btn._hover_bg = "#7dd3fc"
         self.webcam_btn.configure(text="📷 Usar Webcam", bg=BLUE, activebackground="#7dd3fc")
         if was_active and keep_frame and self._image is not None:
             self.path_var.set("Fotograma capturado de Webcam")
-            self._set_status("Fotograma de webcam capturado. Puedes ver su Grad-CAM.", "ready")
-            self._analyze()
+            if analyze:
+                self._set_status("Fotograma de webcam capturado. Puedes ver su Grad-CAM.", "ready")
+                self._analyze()
 
     def _webcam_loop(self) -> None:
         if not self._webcam_active or self._cap is None:
@@ -1181,7 +1231,7 @@ class BasuraFixApp:
         if self._image is None or self.predictor is None or self._busy:
             return
         if self._webcam_active:
-            self.stop_webcam(keep_frame=True)
+            self.stop_webcam(keep_frame=True, analyze=False)
         self._set_busy(True, "Generando mapa de calor (Grad-CAM)…")
         threading.Thread(target=self._heatmap_worker, args=(self._image.copy(),), daemon=True).start()
 
@@ -1325,6 +1375,67 @@ def _print_cli_result(result: dict) -> None:
     print(f"\n  Inferencia: {result['elapsed_ms']:.0f} ms · TTA: {'sí' if result['tta'] else 'no'}")
 
 
+def _run_self_test(report_path: Path, model_path: Path) -> int:
+    """Verifica modelo embebido, TTA, Grad-CAM, OpenCV y Tkinter/Drag&Drop."""
+    report: dict = {"ok": False, "frozen": bool(getattr(sys, "frozen", False))}
+    try:
+        report["model_path"] = str(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Modelo no encontrado: {model_path}")
+
+        predictor = BasuraPredictor(model_path)
+        report["model_info"] = predictor.info()
+
+        # 1) Inferencia con TTA
+        img = Image.fromarray(
+            np.random.default_rng(42).integers(0, 255, size=(300, 300, 3), dtype=np.uint8)
+        )
+        res = predictor.predict(img, topk=3, tta=True)
+        report["predict_label"] = res["label_es"]
+        report["predict_conf"] = round(res["confidence_percent"], 2)
+
+        # 2) Grad-CAM + mapa de calor Turbo
+        exp = predictor.explain(img, size=256)
+        report["gradcam_size"] = list(exp["heatmap"].size)
+
+        # 3) OpenCV (webcam backend disponible)
+        import cv2
+
+        report["cv2_version"] = cv2.__version__
+        report["cv2_has_videocapture"] = hasattr(cv2, "VideoCapture")
+
+        # 4) Tkinter + tkinterdnd2
+        dnd_ok = False
+        try:
+            from tkinterdnd2 import TkinterDnD
+
+            root = TkinterDnD.Tk()
+            dnd_ok = True
+        except Exception:
+            root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        report["tkinter_ok"] = True
+        report["tkinterdnd2_ok"] = dnd_ok
+
+        report["ok"] = True
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 0
+    except Exception as exc:
+        report["error"] = str(exc)
+        report["traceback"] = traceback.format_exc()
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_console()
     parser = argparse.ArgumentParser(
@@ -1337,7 +1448,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--explain", type=Path, help="Guarda el mapa de calor Grad-CAM en esta ruta (modo CLI).")
     parser.add_argument("--no-tta", action="store_true", help="Desactiva Test-Time Augmentation en modo CLI.")
     parser.add_argument("--json", action="store_true", help="Devuelve salida JSON en modo CLI.")
+    parser.add_argument("--self-test", type=Path, help="Ejecuta verificación completa y guarda reporte JSON.")
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        return _run_self_test(args.self_test, args.model)
 
     # Si se pasa una imagen por argumento (sin --demo), se ejecuta por consola
     if args.image and not args.demo:
@@ -1369,14 +1484,24 @@ def main(argv: list[str] | None = None) -> int:
     # Modo Interfaz Gráfica (Fotos + Webcam)
     _enable_dpi_awareness()
     try:
-        from tkinterdnd2 import TkinterDnD
+        try:
+            from tkinterdnd2 import TkinterDnD
 
-        root = TkinterDnD.Tk()
-    except Exception:
-        root = tk.Tk()
-    BasuraFixApp(root, demo_path=args.demo, start_webcam=args.webcam)
-    root.mainloop()
-    return 0
+            root = TkinterDnD.Tk()
+        except Exception:
+            root = tk.Tk()
+        BasuraFixApp(root, demo_path=args.demo, start_webcam=args.webcam)
+        root.mainloop()
+        return 0
+    except Exception as exc:
+        try:
+            messagebox.showerror(
+                "Error al iniciar BasuraFix",
+                f"Ocurrió un error inesperado:\n\n{exc}\n\n{traceback.format_exc()[-600:]}",
+            )
+        except Exception:
+            pass
+        return 1
 
 
 if __name__ == "__main__":

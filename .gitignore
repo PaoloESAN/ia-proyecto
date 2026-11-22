@@ -12,6 +12,12 @@ data/
 *.jpeg
 *.png
 
+# PyInstaller / Build
+build/
+dist/
+*.spec
+basurafix.ico
+
 # OS / editores
 .DS_Store
 Thumbs.db
